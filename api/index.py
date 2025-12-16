@@ -85,6 +85,15 @@ def prompt(body: PromptIn):
         q = (q or "").lower()
         return ("exactly 3" in q) and ("title" in q or "titles" in q)
 
+    def is_edu_learning_match(md: dict) -> bool:
+        title = str(md.get("title", "")).lower()
+        topics = str(md.get("topics", "")).lower()
+
+        # Only metadata-based signals to avoid false positives
+        title_hit = any(k in title for k in ["learn", "learning", "education", "school", "teach", "teaching"])
+        topics_hit = any(k in topics for k in ["education", "learning", "school", "teaching"])
+        return title_hit or topics_hit
+
     def format_three_titles_from_context(ctx: list[dict]) -> str:
         titles = []
         seen = set()
@@ -106,9 +115,16 @@ def prompt(body: PromptIn):
     try:
         llm, index = get_clients()
         question = (body.question or "").strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="question_empty")
+
+        q_lower = question.lower()
 
         # 1) embed question
-        q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
+        q_vec = llm.embeddings.create(
+            model=EMBED_MODEL,
+            input=question
+        ).data[0].embedding
 
         # 2) retrieve more candidates then dedupe by talk_id
         res = index.query(
@@ -118,8 +134,8 @@ def prompt(body: PromptIn):
             namespace=PINECONE_NAMESPACE,
         )
 
-        context = []
-        ctx_text_blocks = []
+        context: list[dict] = []
+        ctx_text_blocks: list[str] = []
         seen_talk_ids = set()
 
         for m in (res.get("matches") or []):
@@ -127,12 +143,18 @@ def prompt(body: PromptIn):
             talk_id = str(md.get("talk_id", "")).strip()
             if not talk_id or talk_id in seen_talk_ids:
                 continue
+
+            # Filter for edu/learning questions using metadata only
+            if ("education" in q_lower) or ("learning" in q_lower):
+                if not is_edu_learning_match(md):
+                    continue
+
             seen_talk_ids.add(talk_id)
 
-            # IMPORTANT: support both metadata keys: "chunk" or "text"
-            chunk = md.get("chunk")
+            # Support both metadata keys: "text" (your indexer) or "chunk"
+            chunk = md.get("text")
             if not chunk:
-                chunk = md.get("text", "")
+                chunk = md.get("chunk", "")
             chunk = str(chunk)
 
             item = {
@@ -141,10 +163,12 @@ def prompt(body: PromptIn):
                 "chunk": chunk,
                 "score": float(m.get("score", 0.0)),
             }
+
             context.append(item)
             ctx_text_blocks.append(
                 f"talk_id={item['talk_id']} | title={item['title']} | score={item['score']:.4f}\n{chunk}"
             )
+
             if len(context) >= TOP_K:
                 break
 
@@ -156,7 +180,7 @@ def prompt(body: PromptIn):
             + "\n\n---\n\n".join(ctx_text_blocks)
         )
 
-        # If the question explicitly asks for exactly 3 titles, return only that (no LLM).
+        # If question explicitly asks for exactly 3 titles, return ONLY that (no LLM).
         if wants_exactly_three_titles(question):
             answer = format_three_titles_from_context(context)
             return {
@@ -187,4 +211,3 @@ def prompt(body: PromptIn):
     except Exception:
         print("ERROR in /api/prompt\n", traceback.format_exc())
         raise HTTPException(status_code=500, detail="prompt_failed")
-
