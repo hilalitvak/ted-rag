@@ -89,10 +89,15 @@ def prompt(body: PromptIn):
         title = str(md.get("title", "")).lower()
         topics = str(md.get("topics", "")).lower()
 
-        # Only metadata-based signals to avoid false positives
-        title_hit = any(k in title for k in ["learn", "learning", "education", "school", "teach", "teaching"])
-        topics_hit = any(k in topics for k in ["education", "learning", "school", "teaching"])
-        return title_hit or topics_hit
+        # STRICT: only topics OR title signals
+        if "education" in topics or "learning" in topics:
+            return True
+
+        if any(k in title for k in ["learn", "learning", "education", "school", "teach", "teaching"]):
+            return True
+
+        return False
+
 
     def format_three_titles_from_context(ctx: list[dict]) -> str:
         titles = []
