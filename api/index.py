@@ -12,7 +12,7 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 def root():
     return {"status": "ok"}
 
-@app.get("/api/stats")
+@app.get("/stats")
 def stats():
     return {
         "chunk_size": CHUNK_SIZE,
@@ -23,7 +23,7 @@ def stats():
 class PromptIn(BaseModel):
     question: str
 
-@app.post("/api/prompt")
+@app.post("/prompt")
 def prompt(body: PromptIn):
     return {
         "response": "TODO",
