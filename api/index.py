@@ -83,30 +83,28 @@ class PromptIn(BaseModel):
 def prompt(body: PromptIn):
     def wants_exactly_three_titles(q: str) -> bool:
         q = (q or "").lower()
-        return ("exactly 3" in q) and ("title" in q or "titles" in q)
+        return ("exactly 3" in q or "exactly three" in q) and ("title" in q or "titles" in q)
 
-    def is_edu_learning_match(md: dict) -> bool:
-        title = str(md.get("title", "")).lower()
-        topics = str(md.get("topics", "")).lower()
+    def format_three_titles_from_context(ctx: list[dict], question: str) -> str:
+        q = (question or "").lower()
+        need_edu = ("education" in q) or ("learning" in q)
 
-        # STRICT: only topics OR title signals
-        if "education" in topics or "learning" in topics:
-            return True
-
-        if any(k in title for k in ["learn", "learning", "education", "school", "teach", "teaching"]):
-            return True
-
-        return False
-
-
-    def format_three_titles_from_context(ctx: list[dict]) -> str:
         titles = []
         seen = set()
+
         for item in ctx:
             tid = str(item.get("talk_id", "")).strip()
             title = (item.get("title") or "").strip()
+            chunk = (item.get("chunk") or "").lower()
+
             if not tid or not title or tid in seen:
                 continue
+
+            # Hard filter for education/learning queries
+            if need_edu:
+                if not (("education" in chunk) or ("learn" in chunk) or ("learning" in chunk)):
+                    continue
+
             seen.add(tid)
             titles.append(title)
             if len(titles) == 3:
@@ -115,21 +113,25 @@ def prompt(body: PromptIn):
         if len(titles) < 3:
             return "I don't know based on the provided TED data."
 
+        # EXACTLY 3 TITLES ONLY (no extra explanation)
         return "\n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
+
+    def is_edu_learning_match(md: dict, chunk_text: str) -> bool:
+        topics = str(md.get("topics", "")).lower()
+        text = (chunk_text or "").lower()
+        return (
+            ("education" in topics) or ("learning" in topics) or
+            ("education" in text) or ("learn" in text) or ("learning" in text)
+        )
 
     try:
         llm, index = get_clients()
         question = (body.question or "").strip()
         if not question:
-            raise HTTPException(status_code=400, detail="question_empty")
-
-        q_lower = question.lower()
+            raise HTTPException(status_code=400, detail="question_required")
 
         # 1) embed question
-        q_vec = llm.embeddings.create(
-            model=EMBED_MODEL,
-            input=question
-        ).data[0].embedding
+        q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
 
         # 2) retrieve more candidates then dedupe by talk_id
         res = index.query(
@@ -139,9 +141,12 @@ def prompt(body: PromptIn):
             namespace=PINECONE_NAMESPACE,
         )
 
-        context: list[dict] = []
-        ctx_text_blocks: list[str] = []
+        context = []
+        ctx_text_blocks = []
         seen_talk_ids = set()
+
+        q_lower = question.lower()
+        edu_query = ("education" in q_lower) or ("learning" in q_lower)
 
         for m in (res.get("matches") or []):
             md = m.get("metadata") or {}
@@ -149,18 +154,17 @@ def prompt(body: PromptIn):
             if not talk_id or talk_id in seen_talk_ids:
                 continue
 
-            # Filter for edu/learning questions using metadata only
-            if ("education" in q_lower) or ("learning" in q_lower):
-                if not is_edu_learning_match(md):
-                    continue
+            # IMPORTANT: support both metadata keys: "chunk" or "text"
+            chunk = md.get("chunk")
+            if not chunk:
+                chunk = md.get("text", "")
+            chunk = str(chunk)
+
+            # Optional hard filter: for edu/learning queries, skip obvious non-matches
+            if edu_query and not is_edu_learning_match(md, chunk):
+                continue
 
             seen_talk_ids.add(talk_id)
-
-            # Support both metadata keys: "text" (your indexer) or "chunk"
-            chunk = md.get("text")
-            if not chunk:
-                chunk = md.get("chunk", "")
-            chunk = str(chunk)
 
             item = {
                 "talk_id": talk_id,
@@ -168,13 +172,16 @@ def prompt(body: PromptIn):
                 "chunk": chunk,
                 "score": float(m.get("score", 0.0)),
             }
-
             context.append(item)
             ctx_text_blocks.append(
                 f"talk_id={item['talk_id']} | title={item['title']} | score={item['score']:.4f}\n{chunk}"
             )
 
-            if len(context) >= TOP_K:
+            # IMPORTANT: in exactly-3-titles mode we might need more than TOP_K
+            # to find 3 matches after filtering, so keep collecting up to 30.
+            if not wants_exactly_three_titles(question) and len(context) >= TOP_K:
+                break
+            if len(context) >= 30:
                 break
 
         user_prompt = (
@@ -185,9 +192,9 @@ def prompt(body: PromptIn):
             + "\n\n---\n\n".join(ctx_text_blocks)
         )
 
-        # If question explicitly asks for exactly 3 titles, return ONLY that (no LLM).
+        # If the question explicitly asks for exactly 3 titles, return only that (no LLM).
         if wants_exactly_three_titles(question):
-            answer = format_three_titles_from_context(context)
+            answer = format_three_titles_from_context(context, question)
             return {
                 "response": answer,
                 "context": context,
