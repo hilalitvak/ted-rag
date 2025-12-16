@@ -83,52 +83,51 @@ class PromptIn(BaseModel):
 def prompt(body: PromptIn):
     def wants_exactly_three_titles(q: str) -> bool:
         q = (q or "").lower()
-        return ("exactly 3" in q or "exactly three" in q) and ("title" in q or "titles" in q)
+        return ("exactly 3" in q) and ("title" in q or "titles" in q)
 
-    def format_three_titles_from_context(ctx: list[dict], question: str) -> str:
-        q = (question or "").lower()
-        need_edu = ("education" in q) or ("learning" in q)
+    def is_edu_learning_question(q: str) -> bool:
+        q = (q or "").lower()
+        return ("education" in q) or ("learning" in q)
 
-        titles = []
-        seen = set()
-
-        for item in ctx:
-            tid = str(item.get("talk_id", "")).strip()
-            title = (item.get("title") or "").strip()
-            chunk = (item.get("chunk") or "").lower()
-
-            if not tid or not title or tid in seen:
-                continue
-
-            # Hard filter for education/learning queries
-            if need_edu:
-                if not (("education" in chunk) or ("learn" in chunk) or ("learning" in chunk)):
-                    continue
-
-            seen.add(tid)
-            titles.append(title)
-            if len(titles) == 3:
-                break
-
-        if len(titles) < 3:
-            return "I don't know based on the provided TED data."
-
-        # EXACTLY 3 TITLES ONLY (no extra explanation)
-        return "\n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
-
-    def is_edu_learning_match(md: dict, chunk_text: str) -> bool:
+    def edu_priority(md: dict, title: str, chunk: str) -> int:
+        """
+        Higher is better.
+        3 = topics contain education/teaching
+        2 = title contains learn/learning
+        1 = chunk mentions education/learn
+        0 = none
+        """
         topics = str(md.get("topics", "")).lower()
-        text = (chunk_text or "").lower()
-        return (
-            ("education" in topics) or ("learning" in topics) or
-            ("education" in text) or ("learn" in text) or ("learning" in text)
-        )
+        t = (title or "").lower()
+        c = (chunk or "").lower()
+
+        if ("education" in topics) or ("teaching" in topics):
+            return 3
+        if ("learn" in t) or ("learning" in t):
+            return 2
+        if ("education" in c) or ("learn" in c) or ("learning" in c) or ("school" in c):
+            return 1
+        return 0
+
+    def normalize_three_titles(answer: str) -> str:
+        # Keep exactly 3 non-empty lines; enforce numbering "1. .."
+        lines = [ln.strip() for ln in (answer or "").splitlines() if ln.strip()]
+        # If model returned a paragraph, try splitting by "1.", "2." etc. fallback: just take lines.
+        if len(lines) == 1 and any(x in lines[0] for x in ["1.", "2.", "3."]):
+            parts = re.split(r"\s*(?:\d+\.)\s*", lines[0])
+            parts = [p.strip() for p in parts if p.strip()]
+            lines = parts
+
+        lines = lines[:3]
+        if len(lines) < 3:
+            return answer  # don't invent
+        return "\n".join([f"{i+1}. {lines[i].lstrip('0123456789. ').strip()}" for i in range(3)])
 
     try:
         llm, index = get_clients()
         question = (body.question or "").strip()
         if not question:
-            raise HTTPException(status_code=400, detail="question_required")
+            raise HTTPException(status_code=400, detail="question_empty")
 
         # 1) embed question
         q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
@@ -141,67 +140,74 @@ def prompt(body: PromptIn):
             namespace=PINECONE_NAMESPACE,
         )
 
-        context = []
-        ctx_text_blocks = []
+        # collect unique talks
+        candidates = []
         seen_talk_ids = set()
-
-        q_lower = question.lower()
-        edu_query = ("education" in q_lower) or ("learning" in q_lower)
 
         for m in (res.get("matches") or []):
             md = m.get("metadata") or {}
             talk_id = str(md.get("talk_id", "")).strip()
             if not talk_id or talk_id in seen_talk_ids:
                 continue
-
-            # IMPORTANT: support both metadata keys: "chunk" or "text"
-            chunk = md.get("chunk")
-            if not chunk:
-                chunk = md.get("text", "")
-            chunk = str(chunk)
-
-            # Optional hard filter: for edu/learning queries, skip obvious non-matches
-            if edu_query and not is_edu_learning_match(md, chunk):
-                continue
-
             seen_talk_ids.add(talk_id)
+
+            title = str(md.get("title", "")).strip()
+            chunk = md.get("chunk") or md.get("text") or ""
+            chunk = str(chunk)
 
             item = {
                 "talk_id": talk_id,
-                "title": str(md.get("title", "")),
+                "title": title,
                 "chunk": chunk,
                 "score": float(m.get("score", 0.0)),
+                "_md": md,  # keep for rerank only (not returned)
             }
-            context.append(item)
-            ctx_text_blocks.append(
-                f"talk_id={item['talk_id']} | title={item['title']} | score={item['score']:.4f}\n{chunk}"
-            )
+            candidates.append(item)
 
-            # IMPORTANT: in exactly-3-titles mode we might need more than TOP_K
-            # to find 3 matches after filtering, so keep collecting up to 30.
-            if not wants_exactly_three_titles(question) and len(context) >= TOP_K:
-                break
-            if len(context) >= 30:
-                break
+        # Decide which items go into final context
+        final_context = []
+
+        if wants_exactly_three_titles(question) and is_edu_learning_question(question):
+            # Rerank to prefer actual education topics
+            ranked = sorted(
+                candidates,
+                key=lambda it: (
+                    edu_priority(it["_md"], it["title"], it["chunk"]),
+                    it["score"],
+                ),
+                reverse=True,
+            )
+            # Take TOP_K items for context display, but ensure first 3 are strongest edu
+            final_context = ranked[:TOP_K]
+        else:
+            # Default: just take top TOP_K by original similarity order (already in candidates order)
+            final_context = candidates[:TOP_K]
+
+        # Build ctx blocks (only the returned fields)
+        context = []
+        ctx_text_blocks = []
+        for it in final_context:
+            item_out = {
+                "talk_id": it["talk_id"],
+                "title": it["title"],
+                "chunk": it["chunk"],
+                "score": it["score"],
+            }
+            context.append(item_out)
+            ctx_text_blocks.append(
+                f"talk_id={item_out['talk_id']} | title={item_out['title']} | score={item_out['score']:.4f}\n{item_out['chunk']}"
+            )
 
         user_prompt = (
             "Use ONLY the TED context below to answer.\n"
-            "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n\n"
+            "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n"
+            "If the question asks for exactly 3 talk titles, output ONLY a numbered list of exactly 3 titles (no extra text).\n\n"
             f"Question: {question}\n\n"
             "TED Context:\n"
             + "\n\n---\n\n".join(ctx_text_blocks)
         )
 
-        # If the question explicitly asks for exactly 3 titles, return only that (no LLM).
-        if wants_exactly_three_titles(question):
-            answer = format_three_titles_from_context(context, question)
-            return {
-                "response": answer,
-                "context": context,
-                "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
-            }
-
-        # Otherwise: call chat model (gpt-5-mini: don't send temperature)
+        # Always call the chat model (per assignment output definition)
         chat = llm.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -211,6 +217,10 @@ def prompt(body: PromptIn):
         )
 
         answer = chat.choices[0].message.content
+
+        # Ensure format for the "exactly 3 titles" case (truncate to 3 lines)
+        if wants_exactly_three_titles(question):
+            answer = normalize_three_titles(answer)
 
         return {
             "response": answer,
