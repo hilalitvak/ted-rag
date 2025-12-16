@@ -1,7 +1,7 @@
 import os
 import traceback
 from typing import Optional, Tuple
-
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -81,9 +81,31 @@ class PromptIn(BaseModel):
 
 @app.post("/api/prompt")
 def prompt(body: PromptIn):
+    def wants_exactly_three_titles(q: str) -> bool:
+        q = (q or "").lower()
+        return ("exactly 3" in q) and ("title" in q or "titles" in q)
+
+    def format_three_titles_from_context(ctx: list[dict]) -> str:
+        titles = []
+        seen = set()
+        for item in ctx:
+            tid = str(item.get("talk_id", "")).strip()
+            title = (item.get("title") or "").strip()
+            if not tid or not title or tid in seen:
+                continue
+            seen.add(tid)
+            titles.append(title)
+            if len(titles) == 3:
+                break
+
+        if len(titles) < 3:
+            return "I don't know based on the provided TED data."
+
+        return "\n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
+
     try:
         llm, index = get_clients()
-        question = body.question.strip()
+        question = (body.question or "").strip()
 
         # 1) embed question
         q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
@@ -102,15 +124,20 @@ def prompt(body: PromptIn):
 
         for m in (res.get("matches") or []):
             md = m.get("metadata") or {}
-            talk_id = md.get("talk_id", "")
+            talk_id = str(md.get("talk_id", "")).strip()
             if not talk_id or talk_id in seen_talk_ids:
                 continue
             seen_talk_ids.add(talk_id)
 
-            chunk = md.get("chunk", "")
+            # IMPORTANT: support both metadata keys: "chunk" or "text"
+            chunk = md.get("chunk")
+            if not chunk:
+                chunk = md.get("text", "")
+            chunk = str(chunk)
+
             item = {
                 "talk_id": talk_id,
-                "title": md.get("title", ""),
+                "title": str(md.get("title", "")),
                 "chunk": chunk,
                 "score": float(m.get("score", 0.0)),
             }
@@ -129,7 +156,16 @@ def prompt(body: PromptIn):
             + "\n\n---\n\n".join(ctx_text_blocks)
         )
 
-        # gpt-5-mini: don't send temperature
+        # If the question explicitly asks for exactly 3 titles, return only that (no LLM).
+        if wants_exactly_three_titles(question):
+            answer = format_three_titles_from_context(context)
+            return {
+                "response": answer,
+                "context": context,
+                "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
+            }
+
+        # Otherwise: call chat model (gpt-5-mini: don't send temperature)
         chat = llm.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -151,3 +187,4 @@ def prompt(body: PromptIn):
     except Exception:
         print("ERROR in /api/prompt\n", traceback.format_exc())
         raise HTTPException(status_code=500, detail="prompt_failed")
+
