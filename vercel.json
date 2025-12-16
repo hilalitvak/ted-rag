@@ -1,5 +1,7 @@
 {
+  "version": 2,
   "builds": [
-    { "src": "api/*.py", "use": "@vercel/python" }
+    { "src": "api/stats.py", "use": "@vercel/python" },
+    { "src": "api/prompt.py", "use": "@vercel/python" }
   ]
 }
