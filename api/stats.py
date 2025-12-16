@@ -9,8 +9,4 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 
 @app.get("/")
 def stats():
-    return {
-        "chunk_size": CHUNK_SIZE,
-        "overlap_ratio": OVERLAP_RATIO,
-        "top_k": TOP_K
-    }
+    return {"chunk_size": CHUNK_SIZE, "overlap_ratio": OVERLAP_RATIO, "top_k": TOP_K}
