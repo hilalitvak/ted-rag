@@ -244,7 +244,7 @@ def prompt(body: PromptIn):
         embed_query = question
         if is_fear_anxiety_question(question):
             # Simple query expansion to improve recall within top-30 retrieval
-            embed_query = question + " anxiety panic phobia stress afraid fear trauma"
+            embed_query = question + " anxiety panic phobia fear afraid stress worry trauma"
         q_vec = llm.embeddings.create(model=EMBED_MODEL, input=embed_query).data[0].embedding
 
 
