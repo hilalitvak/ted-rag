@@ -80,8 +80,8 @@ def get_clients() -> Tuple[OpenAI, object]:
 # ---------------------------------------------------------------------
 def fix_mojibake(s: str) -> str:
     """
-    Fix common UTF-8/Windows-1252 mojibake artifacts that appear in some transcripts.
-    This prevents ugly characters like 'â€™' from leaking into model answers.
+    Fix common UTF-8/Windows-1252 mojibake artifacts in transcripts.
+    Also remove stray 'â' and replacement chars that sometimes leak through.
     """
     if not s:
         return s
@@ -94,11 +94,17 @@ def fix_mojibake(s: str) -> str:
         "â€”": "-",
         "â€¦": "...",
         "Â": "",
+        "\uFFFD": "",  # replacement character �
+        "�": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
-    return s
 
+    # Remove stray 'â' that appears when the following byte is lost
+    s = re.sub(r"â\s+", " ", s)
+    s = s.replace("â", "")
+
+    return s
 
 def wants_exactly_three_titles(q: str) -> bool:
     """
@@ -144,28 +150,39 @@ def edu_priority(md: dict, title: str, chunk: str) -> int:
 
 def fear_priority(md: dict, title: str, chunk: str) -> int:
     """
-    Higher is better, but we require meaningful evidence.
-    0 = no real evidence of fear/anxiety topic
-    2 = at least 2 mild terms (fear/stress/worry...)
-    4-5 = at least 1 strong term (anxiety/panic/phobia/trauma...)
+    Prefer talks where fear/anxiety is a CENTRAL topic (psychology/mental health),
+    not incidental "fear" in a medical/tech talk.
     """
     topics = str(md.get("topics", "")).lower()
     t = (title or "").lower()
     c = (chunk or "").lower()
-
     blob = f"{topics} {t} {c}"
 
-    strong_terms = ["anxiety", "panic", "phobia", "afraid", "fearful", "terror", "trauma", "ptsd"]
-    mild_terms = ["fear", "stress", "worry", "nervous"]
+    # Strong mental-health indicators
+    strong_terms = ["anxiety", "panic", "phobia", "trauma", "ptsd"]
+    # Mild indicators
+    mild_terms = ["fear", "afraid", "stress", "worry", "nervous"]
 
     strong_hits = sum(term in blob for term in strong_terms)
     mild_hits = sum(term in blob for term in mild_terms)
 
+    # Detect "mental" vs "medical" framing
+    mental_terms = ["psychology", "mind", "brain", "emotion", "therapy", "mental", "cognitive", "behavior"]
+    medical_terms = ["health", "medicine", "medical", "cancer", "disease", "hospital", "bioethics", "health care"]
+
+    mental = any(term in blob for term in mental_terms)
+    medical = any(term in blob for term in medical_terms)
+
+    # If we have explicit anxiety/panic/phobia/trauma terms → accept strongly
     if strong_hits >= 1:
-        return 3 + min(strong_hits, 2)  # 4-5
-    if mild_hits >= 2:
-        return 2
+        return 5 + (1 if mental else 0) - (1 if medical and not mental else 0)
+
+    # If only mild fear words → require mental framing, otherwise treat as not relevant
+    if mild_hits >= 2 and mental:
+        return 3
+
     return 0
+
 
 
 def extract_three_titles(answer: str) -> Optional[List[str]]:
@@ -290,6 +307,11 @@ def prompt(body: PromptIn):
                 reverse=True,
             )
             final_context = ranked[:TOP_K]
+
+            # If nothing in retrieved talks has meaningful fear/anxiety evidence, don't guess
+            if not final_context or fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0:
+                final_context = candidates[:TOP_K]  # keep context for transparency, but force "I don't know" via prompt behavior
+
         else:
             final_context = candidates[:TOP_K]
 
