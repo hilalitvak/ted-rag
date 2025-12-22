@@ -80,8 +80,7 @@ def get_clients() -> Tuple[OpenAI, object]:
 # ---------------------------------------------------------------------
 def fix_mojibake(s: str) -> str:
     """
-    Fix common UTF-8/Windows-1252 mojibake artifacts that sometimes appear in transcripts.
-    We also remove stray replacement characters and any remaining lone 'â'.
+    Fix common mojibake artifacts and remove any stray non-printable characters.
     """
     if not s:
         return s
@@ -94,14 +93,18 @@ def fix_mojibake(s: str) -> str:
         "â€”": "-",
         "â€¦": "...",
         "Â": "",
-        "\uFFFD": "",  # replacement char
+        "\uFFFD": "",
         "�": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # Remove stray 'â' that sometimes appears alone
+    # Remove any remaining stray 'â' or similar artifacts
     s = s.replace("â", "")
+
+    # As a final cleanup: remove non-printable control chars
+    s = "".join(ch for ch in s if ch.isprintable())
+
     return s
 
 
