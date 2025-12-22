@@ -1,7 +1,7 @@
 import os
 import traceback
-from typing import Optional, Tuple, List
 import re
+from typing import Optional, Tuple, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -76,36 +76,59 @@ def get_clients() -> Tuple[OpenAI, object]:
 
 
 # ---------------------------------------------------------------------
-# Utility helpers
+# Text cleanup utilities (fix mojibake + enforce ASCII punctuation)
 # ---------------------------------------------------------------------
-def fix_mojibake(s: str) -> str:
+def _try_mojibake_roundtrip(s: str) -> str:
     """
-    Best-effort repair for mojibake (UTF-8 decoded as cp1252/latin1).
-    Then apply targeted replacements.
+    Try to repair UTF-8 bytes that were decoded as cp1252/latin1.
+    This often causes sequences like â€™ â€œ â€ â€“ â€” etc.
+    """
+    if not s:
+        return s
+    if not any(m in s for m in ("â", "Ã", "ï»¿", "\uFFFD", "�")):
+        return s
+
+    candidates = [s]
+    for enc in ("cp1252", "latin1"):
+        try:
+            repaired = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+            if repaired:
+                candidates.append(repaired)
+        except Exception:
+            pass
+
+    def badness(x: str) -> int:
+        return x.count("â") + x.count("Ã") + x.count("�") + x.count("\uFFFD")
+
+    return min(candidates, key=badness)
+
+
+def ascii_punct(s: str) -> str:
+    """Convert smart punctuation to plain ASCII punctuation."""
+    if not s:
+        return s
+    s = s.replace("\u2018", "'").replace("\u2019", "'")  # ‘ ’
+    s = s.replace("\u201C", '"').replace("\u201D", '"')  # “ ”
+    s = s.replace("\u2013", "-").replace("\u2014", "-")  # – —
+    s = s.replace("\u2026", "...")  # …
+    return s
+
+
+def sanitize_text(s: str) -> str:
+    """
+    One-stop cleaning used for:
+      - retrieved chunks/titles (Pinecone metadata)
+      - LLM answers
+      - augmented prompt (User)
+    Goal: remove â/Ã mojibake and output ASCII punctuation.
     """
     if not s:
         return s
 
-    original = s
+    s0 = s
+    s = _try_mojibake_roundtrip(s)
 
-    # Try to "round-trip" repair common mojibake:
-    # If text contains markers like 'â'/'Ã', it often means it was decoded wrong.
-    if any(m in s for m in ("â", "Ã", "ï»¿")):
-        candidates = [s]
-        for enc in ("cp1252", "latin1"):
-            try:
-                repaired = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
-                if repaired:
-                    candidates.append(repaired)
-            except Exception:
-                pass
-
-        def badness(x: str) -> int:
-            return x.count("â") + x.count("Ã") + x.count("�") + x.count("\uFFFD")
-
-        s = min(candidates, key=badness)
-
-    # Targeted replacements (after repair attempt)
+    # Targeted replacements for common mojibake sequences
     repl = {
         "â€™": "'",
         "â€˜": "'",
@@ -121,41 +144,28 @@ def fix_mojibake(s: str) -> str:
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # Fix the specific garbage patterns you are seeing:
-    # Example: "â âShould" or "âtried"
-    s = s.replace("â â", '"')                 # most often becomes an opening quote
-    s = re.sub(r"(?<=\s)â(?=[A-Za-z])", '"', s)  # " âtried" -> " "tried"
-    s = re.sub(r"â(?=[A-Za-z])", '"', s)         # "âtried" -> "tried" (quote)
+    # Sometimes single 'â' remains (e.g., "couple of â I'm")
+    s = s.replace("â", "")
 
-    # If anything still contains mojibake markers, drop only those markers (last resort)
-    s = s.replace("â", "").replace("Ã", "")
+    # Enforce ASCII punctuation
+    s = ascii_punct(s)
 
-    return s if s else original
+    # Final: drop any remaining non-ASCII characters deterministically
+    s = s.encode("ascii", errors="ignore").decode("ascii", errors="ignore")
 
-def ascii_punct(s: str) -> str:
-    if not s:
-        return s
-    # Convert smart punctuation to plain ASCII to avoid Windows console mojibake
-    s = s.replace("\u2018", "'").replace("\u2019", "'")   # ‘ ’
-    s = s.replace("\u201C", '"').replace("\u201D", '"')   # “ ”
-    s = s.replace("\u2013", "-").replace("\u2014", "-")   # – —
-    s = s.replace("\u2026", "...")                        # …
-    return s
+    return s if s else s0
 
-def to_ascii_safe(s: str) -> str:
-    if not s:
-        return s
-    # Drop any remaining non-ASCII chars deterministically
-    return s.encode("ascii", errors="ignore").decode("ascii", errors="ignore")
 
 def enforce_summary_format(answer: str) -> str:
+    """If model glues 'Title:' and 'Short summary...' together, split into lines."""
     if not answer:
         return answer
-    # If model glued Title + summary into same line, split it
-    answer = re.sub(r"(Title:\s*[^\n]+)\s*(Short summary of the key idea:)", r"\1\n\2", answer)
-    return answer
+    return re.sub(r"(Title:\s*[^\n]+)\s*(Short summary of the key idea:)", r"\1\n\2", answer)
 
 
+# ---------------------------------------------------------------------
+# Query intent helpers
+# ---------------------------------------------------------------------
 def wants_exactly_three_titles(q: str) -> bool:
     """Trigger the 'exactly 3 talk titles' formatting rule."""
     q = (q or "").lower()
@@ -163,33 +173,30 @@ def wants_exactly_three_titles(q: str) -> bool:
 
 
 def is_edu_learning_question(q: str) -> bool:
-    """Heuristic: detect education/learning themed queries to bias talk-level reranking."""
+    """Detect education/learning themed queries for reranking."""
     q = (q or "").lower()
     return ("education" in q) or ("learning" in q)
 
 
 def is_fear_anxiety_question(q: str) -> bool:
-    """Heuristic: detect fear/anxiety themed queries for better talk selection."""
+    """Detect fear/anxiety themed queries (conservative)."""
     q = (q or "").lower()
     return ("fear" in q) or ("anxiety" in q)
 
 
 def is_summary_question(q: str) -> bool:
-    """
-    Heuristic: detect a "title + short summary" request.
-    (Used to force summarizing the FIRST context item to avoid mixing multiple talks.)
-    """
+    """Detect a 'title + short summary' request."""
     q = (q or "").lower()
-    return ("summary" in q) or ("short summary" in q) or ("key idea" in q)
+    return ("short summary" in q) or ("key idea" in q) or ("summary" in q)
 
 
 def is_recommendation_question(q: str) -> bool:
-    """Heuristic: detect recommendation-style queries."""
+    """Detect recommendation-style queries."""
     q = (q or "").lower()
     return ("recommend" in q) or ("which talk would you recommend" in q)
 
 
-def edu_priority(md: dict, title: str, chunk: str) -> int:
+def edu_priority(md: Dict[str, Any], title: str, chunk: str) -> int:
     """
     Higher is better.
     3 = topics contain education/teaching
@@ -210,7 +217,7 @@ def edu_priority(md: dict, title: str, chunk: str) -> int:
     return 0
 
 
-def fear_priority(md: dict, title: str, chunk: str) -> int:
+def fear_priority(md: Dict[str, Any], title: str, chunk: str) -> int:
     """
     Conservative filter: only treat fear/anxiety as relevant if there are strong indicators
     (anxiety/panic/phobia/trauma/PTSD) OR mild fear-words + clear mental/psych framing.
@@ -233,39 +240,9 @@ def fear_priority(md: dict, title: str, chunk: str) -> int:
     return 0
 
 
-def extract_three_titles(answer: str) -> Optional[List[str]]:
-    """
-    Extract exactly 3 titles WITHOUT inventing.
-    Returns list[str] if exactly 3 could be extracted, else None.
-    """
-    text = (answer or "").strip()
-    if not text:
-        return None
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    # If the model returned "1. ... 2. ... 3. ..." in a single line
-    if len(lines) == 1 and re.search(r"\b1\.\s*.*\b2\.\s*.*\b3\.", lines[0]):
-        parts = re.split(r"\s*(?:\d+\.)\s*", lines[0])
-        parts = [p.strip() for p in parts if p.strip()]
-        lines = parts
-
-    cleaned: List[str] = []
-    for ln in lines:
-        ln = re.sub(r"^\s*\d+\.\s*", "", ln).strip()
-        ln = re.sub(r"^\s*[-*]\s*", "", ln).strip()
-        if ln:
-            cleaned.append(ln)
-
-    cleaned = cleaned[:3]
-    if len(cleaned) != 3:
-        return None
-    return cleaned
-
-
-def build_context_and_blocks(final_context: List[dict]) -> Tuple[List[dict], List[str]]:
+def build_context_and_blocks(final_context: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Build the output context array + text blocks used inside the augmented prompt."""
-    context_out: List[dict] = []
+    context_out: List[Dict[str, Any]] = []
     blocks: List[str] = []
 
     for it in final_context:
@@ -295,11 +272,7 @@ def root():
 @app.get("/api/stats")
 def stats():
     # Must always reflect current hyperparameters (assignment requirement).
-    return {
-        "chunk_size": CHUNK_SIZE,
-        "overlap_ratio": OVERLAP_RATIO,
-        "top_k": TOP_K
-    }
+    return {"chunk_size": CHUNK_SIZE, "overlap_ratio": OVERLAP_RATIO, "top_k": TOP_K}
 
 
 class PromptIn(BaseModel):
@@ -320,7 +293,7 @@ def prompt(body: PromptIn):
         if not question:
             raise HTTPException(status_code=400, detail="question_empty")
 
-        # 1) Embed question (with query expansion for fear/anxiety to improve recall)
+        # 1) Embed question (with minimal query expansion for fear/anxiety to improve recall)
         embed_query = question
         if is_fear_anxiety_question(question):
             embed_query = question + " anxiety panic phobia fear afraid stress worry trauma"
@@ -338,8 +311,8 @@ def prompt(body: PromptIn):
             namespace=PINECONE_NAMESPACE,
         )
 
-        # 3) Dedupe by talk_id to ensure we return distinct talks
-        candidates: List[dict] = []
+        # 3) Dedupe by talk_id; IMPORTANT: sanitize title/chunk BEFORE storing/returning
+        candidates: List[Dict[str, Any]] = []
         seen_talk_ids = set()
 
         for m in (res.get("matches") or []):
@@ -349,19 +322,23 @@ def prompt(body: PromptIn):
                 continue
             seen_talk_ids.add(talk_id)
 
-            title = fix_mojibake(str(md.get("title", "")).strip())
-            chunk = md.get("chunk") or md.get("text") or ""
-            chunk = fix_mojibake(str(chunk))
+            raw_title = str(md.get("title", "")).strip()
+            raw_chunk = str(md.get("chunk") or md.get("text") or "")
 
-            candidates.append({
-                "talk_id": talk_id,
-                "title": title,
-                "chunk": chunk,
-                "score": float(m.get("score", 0.0)),
-                "_md": md,  # keep for rerank only (not returned)
-            })
+            title = sanitize_text(raw_title)
+            chunk = sanitize_text(raw_chunk)
 
-        # 4) Choose TOP_K items for final context (apply lightweight reranking for some query types)
+            candidates.append(
+                {
+                    "talk_id": talk_id,
+                    "title": title,
+                    "chunk": chunk,
+                    "score": float(m.get("score", 0.0)),
+                    "_md": md,  # keep for rerank only (not returned)
+                }
+            )
+
+        # 4) Choose TOP_K items for final context (light reranking for some query types)
         if wants_exactly_three_titles(question) and is_edu_learning_question(question):
             ranked = sorted(
                 candidates,
@@ -369,7 +346,6 @@ def prompt(body: PromptIn):
                 reverse=True,
             )
             final_context = ranked[:TOP_K]
-
         elif is_fear_anxiety_question(question):
             ranked = sorted(
                 candidates,
@@ -377,18 +353,13 @@ def prompt(body: PromptIn):
                 reverse=True,
             )
             final_context = ranked[:TOP_K]
-
         else:
             final_context = candidates[:TOP_K]
 
         # Build output context + blocks (always needed for assignment output)
         context_out, ctx_text_blocks = build_context_and_blocks(final_context)
 
-        # -----------------------------------------------------------------
-        # Deterministic behavior for "exactly 3 titles":
-        # Return the top 3 titles directly from the retrieved context,
-        # to avoid LLM variability.
-        # -----------------------------------------------------------------
+        # 5) Deterministic behavior for "exactly 3 titles": avoid LLM variability
         if wants_exactly_three_titles(question):
             if len(final_context) >= 3:
                 response_out = "\n".join([f"{i+1}. {final_context[i]['title']}" for i in range(3)])
@@ -403,6 +374,7 @@ def prompt(body: PromptIn):
                 "TED Context:\n"
                 + "\n\n---\n\n".join(ctx_text_blocks)
             )
+            user_prompt = sanitize_text(user_prompt)
 
             return {
                 "response": response_out,
@@ -410,10 +382,7 @@ def prompt(body: PromptIn):
                 "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
             }
 
-        # -----------------------------------------------------------------
-        # Conservative fallback for fear/anxiety:
-        # If the best retrieved talk has no meaningful evidence, do not guess.
-        # -----------------------------------------------------------------
+        # 6) Conservative fallback for fear/anxiety: do not guess if no evidence
         if is_fear_anxiety_question(question):
             if (not final_context) or (fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0):
                 user_prompt = (
@@ -423,16 +392,15 @@ def prompt(body: PromptIn):
                     "TED Context:\n"
                     + "\n\n---\n\n".join(ctx_text_blocks)
                 )
+                user_prompt = sanitize_text(user_prompt)
+
                 return {
                     "response": "I don't know based on the provided TED data.",
                     "context": context_out,
                     "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
                 }
 
-        # -----------------------------------------------------------------
-        # For summary/recommendation questions, force the model to use ONLY
-        # the FIRST context item to avoid mixing multiple talks.
-        # -----------------------------------------------------------------
+        # 7) For summary/recommendation questions: force model to use ONLY the FIRST context item
         ctx_for_llm_blocks = ctx_text_blocks
         if is_summary_question(question) or is_recommendation_question(question):
             ctx_for_llm_blocks = ctx_text_blocks[:1]
@@ -441,14 +409,15 @@ def prompt(body: PromptIn):
             "Use ONLY the TED context below to answer.\n"
             "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n\n"
             "IMPORTANT: Base your answer ONLY on the FIRST context item provided below. Do not use other items.\n\n"
-            "OUTPUT CONSTRAINT: Use ONLY ASCII punctuation. Use straight quotes ' and \". Use hyphen - instead of en/em dashes. No curly quotes.\n\n"
+            "OUTPUT CONSTRAINT: Use ONLY ASCII punctuation. Use straight quotes ' and \". "
+            "Use hyphen - instead of en/em dashes. No curly quotes.\n\n"
             f"Question: {question}\n\n"
             "TED Context:\n"
             + "\n\n---\n\n".join(ctx_for_llm_blocks)
         )
+        user_prompt = sanitize_text(user_prompt)
 
-
-        # 7) Call the chat model
+        # 8) Call the chat model
         chat = llm.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -457,12 +426,9 @@ def prompt(body: PromptIn):
             ],
         )
 
-        answer = fix_mojibake((chat.choices[0].message.content or "").strip())
-        answer = fix_mojibake(answer)
-        answer = ascii_punct(answer)
-        answer = to_ascii_safe(answer)
+        answer = sanitize_text((chat.choices[0].message.content or "").strip())
+        answer = enforce_summary_format(answer)
 
-        # 8) IMPORTANT: assignment requires response to be a STRING
         return {
             "response": answer,
             "context": context_out,
