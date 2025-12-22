@@ -79,10 +79,6 @@ def get_clients() -> Tuple[OpenAI, object]:
 # Utility helpers
 # ---------------------------------------------------------------------
 def fix_mojibake(s: str) -> str:
-    """
-    Fix common UTF-8/Windows-1252 mojibake artifacts in transcripts.
-    Also remove stray 'â' and replacement chars that sometimes leak through.
-    """
     if not s:
         return s
 
@@ -94,17 +90,16 @@ def fix_mojibake(s: str) -> str:
         "â€”": "-",
         "â€¦": "...",
         "Â": "",
-        "\uFFFD": "",  # replacement character �
+        "\uFFFD": "",
         "�": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # Remove stray 'â' that appears when the following byte is lost
-    s = re.sub(r"â\s+", " ", s)
+    # Remove stray 'â' that sometimes appears alone
     s = s.replace("â", "")
-
     return s
+
 
 def wants_exactly_three_titles(q: str) -> bool:
     """
@@ -119,6 +114,12 @@ def is_edu_learning_question(q: str) -> bool:
     """Heuristic: detect education/learning themed queries to bias talk-level reranking."""
     q = (q or "").lower()
     return ("education" in q) or ("learning" in q)
+
+def is_medical_heavy(md: dict, title: str, chunk: str) -> bool:
+    topics = str(md.get("topics", "")).lower()
+    blob = f"{topics} {(title or '').lower()} {(chunk or '').lower()}"
+    medical_terms = ["health", "medicine", "medical", "cancer", "disease", "hospital", "bioethics", "health care"]
+    return any(w in blob for w in medical_terms)
 
 
 def is_fear_anxiety_question(q: str) -> bool:
@@ -149,40 +150,26 @@ def edu_priority(md: dict, title: str, chunk: str) -> int:
 
 
 def fear_priority(md: dict, title: str, chunk: str) -> int:
-    """
-    Prefer talks where fear/anxiety is a CENTRAL topic (psychology/mental health),
-    not incidental "fear" in a medical/tech talk.
-    """
     topics = str(md.get("topics", "")).lower()
-    t = (title or "").lower()
-    c = (chunk or "").lower()
-    blob = f"{topics} {t} {c}"
+    blob = f"{topics} {(title or '').lower()} {(chunk or '').lower()}"
 
-    # Strong mental-health indicators
-    strong_terms = ["anxiety", "panic", "phobia", "trauma", "ptsd"]
-    # Mild indicators
-    mild_terms = ["fear", "afraid", "stress", "worry", "nervous"]
+    strong = ["anxiety", "panic", "phobia", "trauma", "ptsd"]
+    mild   = ["fear", "afraid", "stress", "worry", "nervous"]
+    mental = ["psychology", "therapy", "mental", "emotion", "cognitive", "behavior", "mind"]
 
-    strong_hits = sum(term in blob for term in strong_terms)
-    mild_hits = sum(term in blob for term in mild_terms)
+    strong_hits = sum(w in blob for w in strong)
+    mild_hits   = sum(w in blob for w in mild)
+    has_mental  = any(w in blob for w in mental)
 
-    # Detect "mental" vs "medical" framing
-    mental_terms = ["psychology", "mind", "brain", "emotion", "therapy", "mental", "cognitive", "behavior"]
-    medical_terms = ["health", "medicine", "medical", "cancer", "disease", "hospital", "bioethics", "health care"]
-
-    mental = any(term in blob for term in mental_terms)
-    medical = any(term in blob for term in medical_terms)
-
-    # If we have explicit anxiety/panic/phobia/trauma terms → accept strongly
+    # Strong terms: good even if medical exists
     if strong_hits >= 1:
-        return 5 + (1 if mental else 0) - (1 if medical and not mental else 0)
+        return 5
 
-    # If only mild fear words → require mental framing, otherwise treat as not relevant
-    if mild_hits >= 2 and mental:
+    # Mild terms: only accept if it looks mental/psych, not just medical fear
+    if mild_hits >= 2 and has_mental:
         return 3
 
     return 0
-
 
 
 def extract_three_titles(answer: str) -> Optional[List[str]]:
@@ -313,18 +300,26 @@ def prompt(body: PromptIn):
             )
             final_context = ranked[:TOP_K]
 
-            # If top result still has weak evidence, force "I don't know" rather than a misleading recommendation
-            if final_context and fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0:
-                # Keep context for transparency, but tell the model to answer "I don't know"
-                # Easiest: override the question to push the model to the required fallback
-                # Build context blocks as usual (optional), but return the required fallback
+            # If top talk has no meaningful fear/anxiety evidence, do not guess
+            if not final_context or fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0:
+                # Keep transparency: return retrieved context, but answer is "I don't know..."
+                context = [
+                    {"talk_id": it["talk_id"], "title": it["title"], "chunk": it["chunk"], "score": it["score"]}
+                    for it in (candidates[:TOP_K])
+                ]
+                user_prompt = (
+                    "Use ONLY the TED context below to answer.\n"
+                    "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n\n"
+                    f"Question: {question}\n\n"
+                    "TED Context:\n"
+                    + "\n\n---\n\n".join(
+                        [f"talk_id={c['talk_id']} | title={c['title']} | score={c['score']:.4f}\n{c['chunk']}" for c in context]
+                    )
+                )
                 return {
                     "response": "I don't know based on the provided TED data.",
-                    "context": [
-                        {"talk_id": it["talk_id"], "title": it["title"], "chunk": it["chunk"], "score": it["score"]}
-                        for it in final_context
-                    ],
-                    "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": ""},
+                    "context": context,
+                    "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
                 }
 
         else:
