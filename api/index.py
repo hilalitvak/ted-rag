@@ -93,7 +93,7 @@ def fix_mojibake(s: str) -> str:
         "â€“": "-",
         "â€”": "-",
         "â€¦": "...",
-        "Â": "",  # common stray artifact
+        "Â": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
@@ -116,7 +116,7 @@ def is_edu_learning_question(q: str) -> bool:
 
 
 def is_fear_anxiety_question(q: str) -> bool:
-    """Heuristic: detect fear/anxiety themed queries for better retrieval of relevant talks."""
+    """Heuristic: detect fear/anxiety themed queries for better talk selection."""
     q = (q or "").lower()
     return ("fear" in q) or ("anxiety" in q)
 
@@ -144,22 +144,27 @@ def edu_priority(md: dict, title: str, chunk: str) -> int:
 
 def fear_priority(md: dict, title: str, chunk: str) -> int:
     """
-    Higher is better.
-    3 = mentions anxiety (topics/title/chunk)
-    2 = mentions fear   (topics/title/chunk)
-    1 = related words (stress/panic/phobia)
-    0 = none
+    Higher is better, but we require meaningful evidence.
+    0 = no real evidence of fear/anxiety topic
+    2 = at least 2 mild terms (fear/stress/worry...)
+    4-5 = at least 1 strong term (anxiety/panic/phobia/trauma...)
     """
     topics = str(md.get("topics", "")).lower()
     t = (title or "").lower()
     c = (chunk or "").lower()
 
-    if ("anxiety" in topics) or ("anxiety" in t) or ("anxiety" in c):
-        return 3
-    if ("fear" in topics) or ("fear" in t) or ("fear" in c):
+    blob = f"{topics} {t} {c}"
+
+    strong_terms = ["anxiety", "panic", "phobia", "afraid", "fearful", "terror", "trauma", "ptsd"]
+    mild_terms = ["fear", "stress", "worry", "nervous"]
+
+    strong_hits = sum(term in blob for term in strong_terms)
+    mild_hits = sum(term in blob for term in mild_terms)
+
+    if strong_hits >= 1:
+        return 3 + min(strong_hits, 2)  # 4-5
+    if mild_hits >= 2:
         return 2
-    if ("stress" in c) or ("panic" in c) or ("phobia" in c):
-        return 1
     return 0
 
 
@@ -220,13 +225,9 @@ class PromptIn(BaseModel):
 @app.post("/api/prompt")
 def prompt(body: PromptIn):
     """
-    Main RAG endpoint:
-    - Embed the question
-    - Retrieve from Pinecone
-    - Deduplicate by talk_id (so we recommend distinct talks)
-    - Optional reranking for some query types
-    - Call chat model with SYSTEM_PROMPT + augmented user prompt
-    - Return response + context + augmented prompt (assignment format)
+    Main RAG endpoint (assignment format):
+      - Input:  {"question": "..."}
+      - Output: {"response": "...", "context": [...], "Augmented_prompt": {...}}
     """
     try:
         llm, index = get_clients()
@@ -238,15 +239,20 @@ def prompt(body: PromptIn):
         # 1) Embed question
         q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
 
-        # 2) Retrieve more candidates than TOP_K, then dedupe by talk_id
-        #    Dedupe ensures multi-result listing uses distinct talks (not multiple chunks of same talk).
+        # 2) Retrieve candidates (dedupe to distinct talk_id later)
+        # For fear/anxiety queries, retrieve the maximum allowed candidates to increase recall.
+        retr_k = min(30, max(TOP_K * 4, TOP_K))
+        if is_fear_anxiety_question(question):
+            retr_k = 30
+
         res = index.query(
             vector=q_vec,
-            top_k=min(30, max(TOP_K * 4, TOP_K)),
+            top_k=retr_k,
             include_metadata=True,
             namespace=PINECONE_NAMESPACE,
         )
 
+        # 3) Dedupe by talk_id to ensure we return distinct talks
         candidates = []
         seen_talk_ids = set()
 
@@ -257,20 +263,19 @@ def prompt(body: PromptIn):
                 continue
             seen_talk_ids.add(talk_id)
 
-            title = str(md.get("title", "")).strip()
+            title = fix_mojibake(str(md.get("title", "")).strip())
             chunk = md.get("chunk") or md.get("text") or ""
             chunk = fix_mojibake(str(chunk))
 
             candidates.append({
                 "talk_id": talk_id,
-                "title": fix_mojibake(title),
+                "title": title,
                 "chunk": chunk,
                 "score": float(m.get("score", 0.0)),
                 "_md": md,  # keep for rerank only (not returned)
             })
 
-        # 3) Decide which items go into final context (TOP_K items returned as context)
-        #    We apply lightweight reranking only for certain query categories.
+        # 4) Choose TOP_K items for final context (apply lightweight reranking for some query types)
         if wants_exactly_three_titles(question) and is_edu_learning_question(question):
             ranked = sorted(
                 candidates,
@@ -288,7 +293,7 @@ def prompt(body: PromptIn):
         else:
             final_context = candidates[:TOP_K]
 
-        # 4) Build context output + text blocks for augmented prompt
+        # 5) Build output context + LLM context blocks
         context = []
         ctx_text_blocks = []
 
@@ -301,13 +306,12 @@ def prompt(body: PromptIn):
             }
             context.append(item_out)
 
-            # Context formatting for the LLM: include id/title/score and the chunk.
             ctx_text_blocks.append(
                 f"talk_id={item_out['talk_id']} | title={item_out['title']} | score={item_out['score']:.4f}\n"
                 f"{item_out['chunk']}"
             )
 
-        # 5) Build the augmented user prompt that includes the retrieved context
+        # 6) Build augmented user prompt with retrieved context
         user_prompt = (
             "Use ONLY the TED context below to answer.\n"
             "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n"
@@ -317,7 +321,7 @@ def prompt(body: PromptIn):
             + "\n\n---\n\n".join(ctx_text_blocks)
         )
 
-        # 6) Call the chat model (always, per assignment output definition)
+        # 7) Call the chat model (always, per assignment output definition)
         chat = llm.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
@@ -328,16 +332,14 @@ def prompt(body: PromptIn):
 
         answer = fix_mojibake((chat.choices[0].message.content or "").strip())
 
-        # 7) IMPORTANT: assignment requires response to be a STRING
-        #    For the "exactly 3 titles" case, we enforce formatting but keep type=str.
+        # 8) IMPORTANT: assignment requires response to be a STRING
         response_out: str
         if wants_exactly_three_titles(question):
             titles = extract_three_titles(answer)
             if titles is not None:
                 response_out = "\n".join([f"{i+1}. {titles[i]}" for i in range(3)])
             else:
-                # Do not invent titles; keep model output as-is.
-                response_out = answer
+                response_out = answer  # do not invent
         else:
             response_out = answer
 
