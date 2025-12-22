@@ -254,7 +254,12 @@ def prompt(body: PromptIn):
             raise HTTPException(status_code=400, detail="question_empty")
 
         # 1) Embed question
-        q_vec = llm.embeddings.create(model=EMBED_MODEL, input=question).data[0].embedding
+        embed_query = question
+        if is_fear_anxiety_question(question):
+            # Simple query expansion to improve recall within top-30 retrieval
+            embed_query = question + " anxiety panic phobia stress afraid fear trauma"
+        q_vec = llm.embeddings.create(model=EMBED_MODEL, input=embed_query).data[0].embedding
+
 
         # 2) Retrieve candidates (dedupe to distinct talk_id later)
         # For fear/anxiety queries, retrieve the maximum allowed candidates to increase recall.
@@ -308,9 +313,19 @@ def prompt(body: PromptIn):
             )
             final_context = ranked[:TOP_K]
 
-            # If nothing in retrieved talks has meaningful fear/anxiety evidence, don't guess
-            if not final_context or fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0:
-                final_context = candidates[:TOP_K]  # keep context for transparency, but force "I don't know" via prompt behavior
+            # If top result still has weak evidence, force "I don't know" rather than a misleading recommendation
+            if final_context and fear_priority(final_context[0]["_md"], final_context[0]["title"], final_context[0]["chunk"]) == 0:
+                # Keep context for transparency, but tell the model to answer "I don't know"
+                # Easiest: override the question to push the model to the required fallback
+                # Build context blocks as usual (optional), but return the required fallback
+                return {
+                    "response": "I don't know based on the provided TED data.",
+                    "context": [
+                        {"talk_id": it["talk_id"], "title": it["title"], "chunk": it["chunk"], "score": it["score"]}
+                        for it in final_context
+                    ],
+                    "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": ""},
+                }
 
         else:
             final_context = candidates[:TOP_K]
