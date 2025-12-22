@@ -142,6 +142,12 @@ def ascii_punct(s: str) -> str:
     s = s.replace("\u2026", "...")                        # …
     return s
 
+def to_ascii_safe(s: str) -> str:
+    if not s:
+        return s
+    # Drop any remaining non-ASCII chars deterministically
+    return s.encode("ascii", errors="ignore").decode("ascii", errors="ignore")
+
 def enforce_summary_format(answer: str) -> str:
     if not answer:
         return answer
@@ -454,6 +460,7 @@ def prompt(body: PromptIn):
         answer = fix_mojibake((chat.choices[0].message.content or "").strip())
         answer = fix_mojibake(answer)
         answer = ascii_punct(answer)
+        answer = to_ascii_safe(answer)
 
         # 8) IMPORTANT: assignment requires response to be a STRING
         return {
