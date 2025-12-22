@@ -237,15 +237,13 @@ def prompt(body: PromptIn):
 
         answer = (chat.choices[0].message.content or "").strip()
 
-        # --- FIX: return array for exactly-3-titles request ---
-        response_out: Union[str, List[str]]
+        response_out: str
         if wants_exactly_three_titles(question):
-            titles = extract_three_titles(answer)
+            titles = extract_three_titles(answer)  # מחזירה list[str] או None
             if titles is not None:
-                response_out = titles  # list[str] in JSON
+                response_out = "\n".join([f"{i+1}. {titles[i]}" for i in range(3)])
             else:
-                # Don't invent. Fallback to the raw answer string.
-                response_out = answer
+                response_out = answer  # בלי להמציא
         else:
             response_out = answer
 
@@ -254,6 +252,7 @@ def prompt(body: PromptIn):
             "context": context,
             "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
         }
+
 
     except HTTPException:
         raise
