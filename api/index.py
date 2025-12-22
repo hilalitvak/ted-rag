@@ -1,7 +1,8 @@
 import os
 import traceback
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 import re
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -31,15 +32,18 @@ SYSTEM_PROMPT = (
     "context, quoting or paraphrasing the relevant transcript or metadata when helpful."
 )
 
+
 def normalize_llm_base_url(u: str) -> str:
     u = (u or "").strip().rstrip("/")
     if not u.endswith("/v1"):
         u += "/v1"
     return u
 
+
 # --- Lazy clients (DON'T create at import time) ---
 _llm: Optional[OpenAI] = None
 _index = None
+
 
 def get_clients() -> Tuple[OpenAI, object]:
     global _llm, _index
@@ -64,9 +68,11 @@ def get_clients() -> Tuple[OpenAI, object]:
 
     return _llm, _index
 
+
 @app.get("/")
 def root():
     return {"status": "ok"}
+
 
 @app.get("/api/stats")
 def stats():
@@ -76,8 +82,10 @@ def stats():
         "top_k": TOP_K
     }
 
+
 class PromptIn(BaseModel):
     question: str
+
 
 @app.post("/api/prompt")
 def prompt(body: PromptIn):
@@ -109,19 +117,35 @@ def prompt(body: PromptIn):
             return 1
         return 0
 
-    def normalize_three_titles(answer: str) -> str:
-        # Keep exactly 3 non-empty lines; enforce numbering "1. .."
-        lines = [ln.strip() for ln in (answer or "").splitlines() if ln.strip()]
-        # If model returned a paragraph, try splitting by "1.", "2." etc. fallback: just take lines.
-        if len(lines) == 1 and any(x in lines[0] for x in ["1.", "2.", "3."]):
+    def extract_three_titles(answer: str) -> Optional[List[str]]:
+        """
+        Return exactly 3 titles as a list[str] WITHOUT inventing.
+        If we can't reliably extract exactly 3, return None.
+        """
+        text = (answer or "").strip()
+        if not text:
+            return None
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        # If model returned one line containing "1. ... 2. ... 3. ..."
+        if len(lines) == 1 and re.search(r"\b1\.\s*.*\b2\.\s*.*\b3\.", lines[0]):
             parts = re.split(r"\s*(?:\d+\.)\s*", lines[0])
             parts = [p.strip() for p in parts if p.strip()]
             lines = parts
 
-        lines = lines[:3]
-        if len(lines) < 3:
-            return answer  # don't invent
-        return "\n".join([f"{i+1}. {lines[i].lstrip('0123456789. ').strip()}" for i in range(3)])
+        cleaned: List[str] = []
+        for ln in lines:
+            # Remove leading "1. ", "2. ", "- ", "* " etc.
+            ln = re.sub(r"^\s*\d+\.\s*", "", ln).strip()
+            ln = re.sub(r"^\s*[-*]\s*", "", ln).strip()
+            if ln:
+                cleaned.append(ln)
+
+        cleaned = cleaned[:3]
+        if len(cleaned) != 3:
+            return None
+        return cleaned
 
     try:
         llm, index = get_clients()
@@ -165,10 +189,7 @@ def prompt(body: PromptIn):
             candidates.append(item)
 
         # Decide which items go into final context
-        final_context = []
-
         if wants_exactly_three_titles(question) and is_edu_learning_question(question):
-            # Rerank to prefer actual education topics
             ranked = sorted(
                 candidates,
                 key=lambda it: (
@@ -177,10 +198,8 @@ def prompt(body: PromptIn):
                 ),
                 reverse=True,
             )
-            # Take TOP_K items for context display, but ensure first 3 are strongest edu
             final_context = ranked[:TOP_K]
         else:
-            # Default: just take top TOP_K by original similarity order (already in candidates order)
             final_context = candidates[:TOP_K]
 
         # Build ctx blocks (only the returned fields)
@@ -216,14 +235,22 @@ def prompt(body: PromptIn):
             ],
         )
 
-        answer = chat.choices[0].message.content
+        answer = (chat.choices[0].message.content or "").strip()
 
-        # Ensure format for the "exactly 3 titles" case (truncate to 3 lines)
+        # --- FIX: return array for exactly-3-titles request ---
+        response_out: Union[str, List[str]]
         if wants_exactly_three_titles(question):
-            answer = normalize_three_titles(answer)
+            titles = extract_three_titles(answer)
+            if titles is not None:
+                response_out = titles  # list[str] in JSON
+            else:
+                # Don't invent. Fallback to the raw answer string.
+                response_out = answer
+        else:
+            response_out = answer
 
         return {
-            "response": answer,
+            "response": response_out,
             "context": context,
             "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt},
         }
