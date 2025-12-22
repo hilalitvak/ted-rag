@@ -80,43 +80,64 @@ def get_clients() -> Tuple[OpenAI, object]:
 # ---------------------------------------------------------------------
 def fix_mojibake(s: str) -> str:
     """
-    Repair common UTF-8-as-cp1252/latin1 mojibake seen in TED transcripts and model outputs.
-    Do NOT drop characters blindly (it breaks words like doesnâ€™t -> doesnât).
+    Best-effort repair for mojibake (UTF-8 decoded as cp1252/latin1).
+    Then apply targeted replacements.
     """
     if not s:
         return s
 
-    # Try a reversible repair for typical mojibake (best-effort)
-    # Example: “doesnâ€™t” -> “doesn’t”
-    try:
-        if any(x in s for x in ["â", "Ã", "ï»¿"]):
-            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-            # Keep the repaired version only if it looks better (fewer mojibake markers)
-            if repaired and (repaired.count("â") + repaired.count("Ã")) < (s.count("â") + s.count("Ã")):
-                s = repaired
-    except Exception:
-        pass
+    original = s
 
-    # Targeted replacements (after attempted repair)
+    # Try to "round-trip" repair common mojibake:
+    # If text contains markers like 'â'/'Ã', it often means it was decoded wrong.
+    if any(m in s for m in ("â", "Ã", "ï»¿")):
+        candidates = [s]
+        for enc in ("cp1252", "latin1"):
+            try:
+                repaired = s.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+                if repaired:
+                    candidates.append(repaired)
+            except Exception:
+                pass
+
+        def badness(x: str) -> int:
+            return x.count("â") + x.count("Ã") + x.count("�") + x.count("\uFFFD")
+
+        s = min(candidates, key=badness)
+
+    # Targeted replacements (after repair attempt)
     repl = {
         "â€™": "'",
+        "â€˜": "'",
         "â€œ": '"',
         "â€": '"',
         "â€“": "-",
         "â€”": "-",
         "â€¦": "...",
         "Â": "",
-        "\uFFFD": "",  # replacement char
+        "\uFFFD": "",
         "�": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # Last resort: remove lone mojibake markers that survived
+    # Fix the specific garbage patterns you are seeing:
+    # Example: "â âShould" or "âtried"
+    s = s.replace("â â", '"')                 # most often becomes an opening quote
+    s = re.sub(r"(?<=\s)â(?=[A-Za-z])", '"', s)  # " âtried" -> " "tried"
+    s = re.sub(r"â(?=[A-Za-z])", '"', s)         # "âtried" -> "tried" (quote)
+
+    # If anything still contains mojibake markers, drop only those markers (last resort)
     s = s.replace("â", "").replace("Ã", "")
 
-    return s
+    return s if s else original
 
+def enforce_summary_format(answer: str) -> str:
+    if not answer:
+        return answer
+    # If model glued Title + summary into same line, split it
+    answer = re.sub(r"(Title:\s*[^\n]+)\s*(Short summary of the key idea:)", r"\1\n\2", answer)
+    return answer
 
 
 def wants_exactly_three_titles(q: str) -> bool:
@@ -418,9 +439,10 @@ def prompt(body: PromptIn):
             ],
         )
 
-        answer = (chat.choices[0].message.content or "").strip()
-        answer = fix_mojibake(answer)
-        answer = fix_mojibake(answer)
+        answer = fix_mojibake((chat.choices[0].message.content or "").strip())
+        answer = fix_mojibake(answer)  # run twice
+        answer = enforce_summary_format(answer)
+
 
 
         # 8) IMPORTANT: assignment requires response to be a STRING
