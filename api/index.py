@@ -156,6 +156,27 @@ def sanitize_context_text(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s).strip()
     return s
 
+FALLBACK = "I don't know based on the provided TED data."
+
+def enforce_exact_fallback(answer: str) -> str:
+    """
+    If the model indicates fallback in any way, return EXACTLY the fallback string.
+    This prevents the model from appending explanations after the fallback.
+    """
+    if not answer:
+        return answer
+    a = answer.strip()
+
+    # If fallback appears anywhere (common failure: fallback + extra explanation)
+    if FALLBACK in a:
+        return FALLBACK
+
+    # Also catch near-misses like extra whitespace/newlines around it
+    if a.replace("\r", "").strip() == FALLBACK:
+        return FALLBACK
+
+    return answer
+
 # ---------------------------------------------------------------------
 # Heuristics
 # ---------------------------------------------------------------------
@@ -376,6 +397,7 @@ def prompt(body: PromptIn):
         answer = fix_mojibake(answer)
         answer = ascii_punct(answer)
         answer = to_ascii_safe(answer)
+        answer = enforce_exact_fallback(answer)   # <<< ADD THIS
 
         return {"response": answer, "context": context_out, "Augmented_prompt": {"System": SYSTEM_PROMPT, "User": user_prompt}}
 
