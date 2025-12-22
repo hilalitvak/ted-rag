@@ -80,11 +80,24 @@ def get_clients() -> Tuple[OpenAI, object]:
 # ---------------------------------------------------------------------
 def fix_mojibake(s: str) -> str:
     """
-    Fix common mojibake artifacts and remove any stray non-printable characters.
+    Repair common UTF-8-as-cp1252/latin1 mojibake seen in TED transcripts and model outputs.
+    Do NOT drop characters blindly (it breaks words like doesnâ€™t -> doesnât).
     """
     if not s:
         return s
 
+    # Try a reversible repair for typical mojibake (best-effort)
+    # Example: “doesnâ€™t” -> “doesn’t”
+    try:
+        if any(x in s for x in ["â", "Ã", "ï»¿"]):
+            repaired = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+            # Keep the repaired version only if it looks better (fewer mojibake markers)
+            if repaired and (repaired.count("â") + repaired.count("Ã")) < (s.count("â") + s.count("Ã")):
+                s = repaired
+    except Exception:
+        pass
+
+    # Targeted replacements (after attempted repair)
     repl = {
         "â€™": "'",
         "â€œ": '"',
@@ -93,19 +106,17 @@ def fix_mojibake(s: str) -> str:
         "â€”": "-",
         "â€¦": "...",
         "Â": "",
-        "\uFFFD": "",
+        "\uFFFD": "",  # replacement char
         "�": "",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # Remove any remaining stray 'â' or similar artifacts
-    s = s.replace("â", "")
-
-    # As a final cleanup: remove non-printable control chars
-    s = "".join(ch for ch in s if ch.isprintable())
+    # Last resort: remove lone mojibake markers that survived
+    s = s.replace("â", "").replace("Ã", "")
 
     return s
+
 
 
 def wants_exactly_three_titles(q: str) -> bool:
@@ -407,7 +418,10 @@ def prompt(body: PromptIn):
             ],
         )
 
-        answer = fix_mojibake((chat.choices[0].message.content or "").strip())
+        answer = (chat.choices[0].message.content or "").strip()
+        answer = fix_mojibake(answer)
+        answer = fix_mojibake(answer)
+
 
         # 8) IMPORTANT: assignment requires response to be a STRING
         return {
