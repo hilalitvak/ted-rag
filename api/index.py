@@ -132,6 +132,16 @@ def fix_mojibake(s: str) -> str:
 
     return s if s else original
 
+def ascii_punct(s: str) -> str:
+    if not s:
+        return s
+    # Convert smart punctuation to plain ASCII to avoid Windows console mojibake
+    s = s.replace("\u2018", "'").replace("\u2019", "'")   # ‘ ’
+    s = s.replace("\u201C", '"').replace("\u201D", '"')   # “ ”
+    s = s.replace("\u2013", "-").replace("\u2014", "-")   # – —
+    s = s.replace("\u2026", "...")                        # …
+    return s
+
 def enforce_summary_format(answer: str) -> str:
     if not answer:
         return answer
@@ -425,10 +435,12 @@ def prompt(body: PromptIn):
             "Use ONLY the TED context below to answer.\n"
             "If the answer is not determinable from the context, reply exactly: I don't know based on the provided TED data.\n\n"
             "IMPORTANT: Base your answer ONLY on the FIRST context item provided below. Do not use other items.\n\n"
+            "OUTPUT CONSTRAINT: Use ONLY ASCII punctuation. Use straight quotes ' and \". Use hyphen - instead of en/em dashes. No curly quotes.\n\n"
             f"Question: {question}\n\n"
             "TED Context:\n"
             + "\n\n---\n\n".join(ctx_for_llm_blocks)
         )
+
 
         # 7) Call the chat model
         chat = llm.chat.completions.create(
@@ -441,11 +453,7 @@ def prompt(body: PromptIn):
 
         answer = fix_mojibake((chat.choices[0].message.content or "").strip())
         answer = fix_mojibake(answer)
-        answer = re.sub(r"\s+â\s+", " - ", answer)
-        answer = answer.replace("â", "")
-
-
-
+        answer = ascii_punct(answer)
 
         # 8) IMPORTANT: assignment requires response to be a STRING
         return {
