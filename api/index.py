@@ -440,8 +440,10 @@ def prompt(body: PromptIn):
         )
 
         answer = fix_mojibake((chat.choices[0].message.content or "").strip())
-        answer = fix_mojibake(answer)  # run twice
-        answer = enforce_summary_format(answer)
+        answer = fix_mojibake(answer)
+        answer = re.sub(r"\s+â\s+", " - ", answer)
+        answer = answer.replace("â", "")
+
 
 
 
